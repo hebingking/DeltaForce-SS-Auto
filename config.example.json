@@ -1,0 +1,106 @@
+{
+  "wegeame_exe": "D:\\app\\WeGame\\wegame.exe",
+  "wegeame_process_hint": "qbblinktrial\\browser.exe",
+  "game_process_hint": "DeltaForceClient-Win64-Shipping.exe",
+  "game_title_hint": "三角洲行动",
+  "ocr": {
+    "backend": "rapidocr",
+    "language": "zh-Hans",
+    "max_dimension": 3000,
+    "native_upscale": 2.0
+  },
+  "stations": [
+    "技术中心",
+    "工作台",
+    "制药台",
+    "防具台"
+  ],
+  "exit_game_after_read": true,
+  "close_wegame_after_run": false,
+  "close_wegame_delay_seconds": 5,
+  "prevent_sleep": true,
+  "catch_up_hours": 24,
+  "lock_retry_minutes": 5,
+  "lock_retry_max": 24,
+  "craft": {
+    "enabled": true,
+    "max_purchase_total": null,
+    "items": [
+      {
+        "station": "技术中心",
+        "name": "全景红点瞄准镜",
+        "fallback_xy": null
+      },
+      {
+        "station": "工作台",
+        "name": "4.6x30mm AP SX",
+        "fallback_xy": null
+      },
+      {
+        "station": "制药台",
+        "name": "体能强化剂",
+        "fallback_xy": null
+      },
+      {
+        "station": "防具台",
+        "name": "精英防弹背心",
+        "fallback_xy": null
+      }
+    ]
+  },
+  "exchange": {
+    "enabled": true,
+    "min_discount_percent": 20,
+    "items": [
+      "5.45x39mm BT",
+      ".45 ACP RIP",
+      "9x19mm RIP",
+      "5.7x28mm R37.F",
+      "12 Gauge 8.5毫米鹿弹"
+    ]
+  },
+  "rule": {
+    "group_threshold_minutes": 10,
+    "buffer_seconds": 60
+  },
+  "timeouts": {
+    "wegame_window": 120,
+    "wegame_home": 60,
+    "detail_page": 45,
+    "game_window": 240,
+    "mode_select": 120,
+    "activity": 90,
+    "lobby": 90,
+    "teqin": 60
+  },
+  "poll": {
+    "interval": 2.0
+  },
+  "notify": {
+    "beep": true
+  },
+  "accounts": {
+    "items": [
+      {
+        "key": "QQ",
+        "label": "QQ",
+        "matches": [
+          "QQ"
+        ],
+        "uid": "",
+        "enabled": true
+      },
+      {
+        "key": "WX",
+        "label": "微信",
+        "matches": [
+          "微信"
+        ],
+        "uid": "",
+        "enabled": true
+      }
+    ]
+  },
+  "multi_account_mode": "per_account",
+  "schedule_merge_minutes": 10
+}

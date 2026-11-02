@@ -1,0 +1,16 @@
+.venv/
+build/
+dist/
+logs/
+__pycache__/
+*.py[cod]
+*.log
+*.exe
+*.zip
+config.json
+config.local.json
+accounts_state.json
+exchange_history.json
+state.json
+.idea/
+.vscode/
