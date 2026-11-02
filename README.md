@@ -48,7 +48,7 @@ Windows 桌面自动化工具：自动启动 WeGame → 三角洲行动 → 进�
 
 运行后程序在托盘常驻，主界面可保存配置、立即执行、取消当前流程和查看日志。
 
-> Release 里的 `orc-sjz.exe` 为 v0.01 构建，SHA-256：`5e93bf97ff6bd29b0c8d7114dc234de3991b0076f458e1e41f2a0cae4c2af740`。
+> Release 里的 `orc-sjz.exe` 为 v0.01 构建，SHA-256：`5802d0f50d5e5eb54eb1bc3c9a2c9995221942809bbea082d8289cb2fefe33bb`。
 
 ---
 

@@ -17,6 +17,30 @@ from workshop import Workshop
 
 HISTORY_KEEP_DAYS = 30
 
+EXCHANGE_SUCCESS_WORDS = (
+    "购买成功",
+    "兑换成功",
+    "交易成功",
+    "兑换完成",
+    "购买完成",
+    "已兑换",
+)
+EXCHANGE_FAILURE_WORDS = (
+    "购买失败",
+    "兑换失败",
+    "交易失败",
+    "材料不足",
+    "余额不足",
+    "库存不足",
+    "无法购买",
+    "无法兑换",
+)
+DIALOG_MODAL_WORDS = (
+    "清单",
+    "军需处兑换",
+    "确定用以下物品",
+) + EXCHANGE_SUCCESS_WORDS + EXCHANGE_FAILURE_WORDS
+
 
 class ExchangeError(RuntimeError):
     pass
@@ -274,14 +298,23 @@ class ExchangeRunner:
 
     def _search_box_xy(self, image, lines):
         width, height = image.size if image else (1920, 1080)
-        box = find_line(lines, "请输入想要查找的商品", min_score=0.55)
+        cached = self._search_box
+        if cached is not None and cached[0] == width and cached[1] == height:
+            return cached[2], cached[3]
+        box = find_line(
+            lines,
+            "请输入想要查找的商品",
+            min_score=0.55,
+            x_max=width * 0.22,
+        )
         if box is None:
             for name in self.items:
                 box = find_line(
                     lines,
                     name,
                     min_score=0.7,
-                    y_max=height * 0.14,
+                    x_max=width * 0.22,
+                    y_max=height * 0.2,
                 )
                 if box is not None:
                     break
@@ -289,9 +322,6 @@ class ExchangeRunner:
             self._search_box = (width, height, box.cx, box.cy)
             self.log(f"[exchange] 搜索框 @({box.cx:.0f},{box.cy:.0f})")
             return box.cx, box.cy
-        cached = self._search_box
-        if cached is not None and cached[0] == width and cached[1] == height:
-            return cached[2], cached[3]
         if cached is not None:
             self._search_box = None
         return width * 0.115, height * 0.13
@@ -539,8 +569,108 @@ class ExchangeRunner:
         self._back_to_search(game)
         return {"item": name, "ok": ok, "discount": discount}
 
+    @staticmethod
+    def _has_any(text: str, words) -> bool:
+        return any(word in text for word in words)
+
+    def _find_dismiss_button(self, lines, size):
+        width, height = size
+        for label in ("确定", "关闭", "完成", "知道了", "好的"):
+            button = find_line(
+                lines,
+                label,
+                min_score=0.85,
+                x_min=width * 0.3,
+                x_max=width * 0.7,
+                y_min=height * 0.35,
+                y_max=height * 0.9,
+            )
+            if button is not None:
+                return button
+        return None
+
+    def _dismiss_result_dialog(self, game) -> bool:
+        for _ in range(2):
+            snapshot = self._snapshot(game)
+            if snapshot is None:
+                time.sleep(1.0)
+                continue
+            image, lines = snapshot
+            text = self._text(lines)
+            button = self._find_dismiss_button(lines, image.size)
+            if button is not None:
+                self.log(
+                    f"[exchange] 关闭结果弹窗 @({button.cx:.0f},{button.cy:.0f})"
+                )
+                winutil.click_client(game.hwnd, button.cx, button.cy)
+                time.sleep(1.5)
+                continue
+            if self._has_any(text, DIALOG_MODAL_WORDS):
+                winutil.press_key("escape")
+                time.sleep(1.2)
+                continue
+            return True
+        snapshot = self._snapshot(game)
+        if snapshot is None:
+            return True
+        return not self._has_any(self._text(snapshot[1]), DIALOG_MODAL_WORDS)
+
+    def _wait_exchange_result(self, game) -> bool:
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            snapshot = self._snapshot(game)
+            if snapshot is None:
+                time.sleep(1.2)
+                continue
+            image, lines = snapshot
+            width, height = image.size
+            text = self._text(lines)
+            if self._has_any(text, EXCHANGE_SUCCESS_WORDS):
+                self.log("[exchange] 识别到兑换成功")
+                self._dismiss_result_dialog(game)
+                return True
+            if self._has_any(text, EXCHANGE_FAILURE_WORDS):
+                self.log("[exchange] 识别到兑换失败/材料或余额不足")
+                self._dismiss_result_dialog(game)
+                return False
+            confirm = find_line(
+                lines,
+                "确认",
+                min_score=0.85,
+                y_min=height * 0.5,
+                y_max=height * 0.8,
+                x_min=width * 0.45,
+                x_max=width * 0.7,
+            )
+            if confirm is not None:
+                self.log(
+                    f"[exchange] 点击第二层确认 @({confirm.cx:.0f},{confirm.cy:.0f})"
+                )
+                winutil.click_client(game.hwnd, confirm.cx, confirm.cy)
+                time.sleep(2.0)
+                continue
+            if self._has_any(text, DIALOG_MODAL_WORDS):
+                button = self._find_dismiss_button(lines, image.size)
+                if button is not None:
+                    self.log(
+                        f"[exchange] 关闭结果弹窗 @({button.cx:.0f},{button.cy:.0f})"
+                    )
+                    winutil.click_client(game.hwnd, button.cx, button.cy)
+                    time.sleep(1.5)
+                    continue
+                winutil.press_key("escape")
+                time.sleep(1.2)
+                continue
+            if self._market_ready(lines, image.size) or "兑换" in text:
+                self.log("[exchange] 结果弹窗已关闭，按成功处理")
+                return True
+            time.sleep(1.2)
+        self.log("[exchange] 等待兑换结果超时，按失败处理")
+        self._dismiss_result_dialog(game)
+        return False
+
     def _complete_exchange(self, game) -> bool:
-        deadline = time.time() + 45
+        deadline = time.time() + 50
         while time.time() < deadline:
             snapshot = self._snapshot(game)
             if snapshot is None:
@@ -549,6 +679,15 @@ class ExchangeRunner:
             image, lines = snapshot
             width, height = image.size
             text = self._text(lines)
+
+            if self._has_any(text, EXCHANGE_SUCCESS_WORDS):
+                self.log("[exchange] 识别到兑换成功")
+                self._dismiss_result_dialog(game)
+                return True
+            if self._has_any(text, EXCHANGE_FAILURE_WORDS):
+                self.log("[exchange] 识别到兑换失败/材料或余额不足")
+                self._dismiss_result_dialog(game)
+                return False
 
             confirm = find_line(
                 lines,
@@ -562,8 +701,8 @@ class ExchangeRunner:
             if confirm is not None:
                 self.log(f"[exchange] 点击确认 @({confirm.cx:.0f},{confirm.cy:.0f})")
                 winutil.click_client(game.hwnd, confirm.cx, confirm.cy)
-                time.sleep(2.5)
-                return True
+                time.sleep(2.0)
+                return self._wait_exchange_result(game)
 
             price = self.workshop._modal_price(lines, image.size)
             if price is not None:
@@ -592,23 +731,48 @@ class ExchangeRunner:
                 time.sleep(2.0)
                 continue
 
-            if "兑换成功" in text or "已兑换" in text:
-                return True
             time.sleep(1.5)
         self.log("[exchange] 兑换流程超时未完成")
+        self._dismiss_result_dialog(game)
         return False
 
+    def _search_page_ready(self, lines, size) -> bool:
+        if not self._market_ready(lines, size):
+            return False
+        if find_line(lines, "请输入想要查找的商品", min_score=0.55) is not None:
+            return True
+        cached = self._search_box
+        return bool(
+            cached is not None
+            and cached[0] == size[0]
+            and cached[1] == size[1]
+        )
+
     def _back_to_search(self, game) -> None:
-        for _ in range(2):
+        for _ in range(3):
             snapshot = self._snapshot(game)
             if snapshot is not None:
                 image, lines = snapshot
                 text = self._text(lines)
+                if self._has_any(
+                    text, EXCHANGE_SUCCESS_WORDS + EXCHANGE_FAILURE_WORDS
+                ):
+                    self.log("[exchange] 发现结果弹窗，先关闭")
+                    self._dismiss_result_dialog(game)
+                    continue
                 modal = any(
                     key in text for key in ("清单", "军需处兑换", "确定用以下物品")
                 )
-                if not modal and self._market_ready(lines, image.size):
+                if not modal and self._search_page_ready(lines, image.size):
                     return
+                dismiss = self._find_dismiss_button(lines, image.size)
+                if dismiss is not None:
+                    self.log(
+                        f"[exchange] 关闭弹窗 @({dismiss.cx:.0f},{dismiss.cy:.0f})"
+                    )
+                    winutil.click_client(game.hwnd, dismiss.cx, dismiss.cy)
+                    time.sleep(1.5)
+                    continue
             winutil.press_key("escape")
             time.sleep(1.5)
         snapshot = self._snapshot(game)
@@ -622,7 +786,7 @@ class ExchangeRunner:
         snapshot = self._snapshot(game)
         if snapshot is not None:
             image, lines = snapshot
-            if not self._market_ready(lines, image.size):
+            if not self._search_page_ready(lines, image.size):
                 self.log("[exchange] 警告：未能回到交易行搜索页")
 
     def _return_to_teqin(self, game) -> None:
