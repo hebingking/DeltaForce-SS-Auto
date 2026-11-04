@@ -7,7 +7,10 @@
     "backend": "rapidocr",
     "language": "zh-Hans",
     "max_dimension": 3000,
-    "native_upscale": 2.0
+    "native_upscale": 2.0,
+    "fast_max_dimension": 3000,
+    "fast_upscale": 1.0,
+    "fast_det_limit": 1152
   },
   "stations": [
     "技术中心",

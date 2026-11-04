@@ -12,5 +12,6 @@ config.local.json
 accounts_state.json
 exchange_history.json
 state.json
+HANDOFF.md
 .idea/
 .vscode/

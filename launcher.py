@@ -13,7 +13,7 @@ from accounts import AccountStore, parse_uid
 from cancel import RunCancelled
 from exchange import ExchangeRunner
 from ocr_backend import normalize
-from reader import LOGIN_KEYWORDS, Reader, find_line, match_score
+from reader import BASE_DIR, LOGIN_KEYWORDS, Reader, find_line, match_score
 from workshop import Workshop
 
 
@@ -61,14 +61,8 @@ class Launcher:
         self._verify_account(game, account)
         self._drive_to_teqin(game)
         time.sleep(2.0)
-        if self.config.get("exchange", {}).get("enabled", True):
-            try:
-                self.exchange.run(game, account["key"] if account else "")
-            except RunCancelled:
-                raise
-            except Exception as exc:
-                self.log(f"[launcher] 交易行兑换失败: {exc}")
-            time.sleep(1.5)
+        # 顺序：先领取/制造（每天必做、耗时短），再判断今天还要不要进交易行兑换子弹。
+        # 兑换要跑 8 次 OCR/颗且容易卡，放在最后，失败也不影响当天的领取/制作。
         if self.config.get("craft", {}).get("enabled", True):
             try:
                 self.workshop.run(game)
@@ -77,6 +71,30 @@ class Launcher:
             except Exception as exc:
                 self.log(f"[launcher] 领取/制作流程失败: {exc}")
             time.sleep(1.5)
+        if self.config.get("exchange", {}).get("enabled", True):
+            account_key = account["key"] if account else ""
+            pending = self.exchange.pending_items(account_key)
+            if not pending:
+                if self.exchange.items:
+                    self.log(
+                        "[launcher] 今日兑换子弹已全部完成，"
+                        "跳过交易行（不进入兑换流程）"
+                    )
+                else:
+                    self.log("[launcher] 未配置兑换子弹，跳过交易行")
+            else:
+                self.log(
+                    "[launcher] 今日仍待兑换："
+                    + "、".join(pending)
+                    + "，进入交易行"
+                )
+                try:
+                    self.exchange.run(game, account_key)
+                except RunCancelled:
+                    raise
+                except Exception as exc:
+                    self.log(f"[launcher] 交易行兑换失败: {exc}")
+                time.sleep(1.5)
         cancel.check()
         result = self.reader.read(game)
         cancel.check()
@@ -426,19 +444,175 @@ class Launcher:
                 return True
         return False
 
-    def _wait_account_menu(self, window, timeout: float = 8.0):
+    def _account_menu_region(self, size) -> tuple[int, int, int, int]:
+        """账号选择器弹窗的大致区域（客户端像素）。
+
+        弹窗贴在「启动」按钮左侧的账号按钮上方，实测账号行落在
+        cy 0.72~0.86、cx 0.55~0.68；这里留足余量以适配不同分辨率/DPI。
+        """
+        width, height = size
+        return (
+            int(width * 0.42),
+            int(height * 0.60),
+            int(width * 0.90),
+            int(height * 0.98),
+        )
+
+    def _read_account_popup(self, window, account: dict, start, size, timeout=5.0):
+        """轮询账号选择器，返回 (目标行, 截图, 该帧全部行, 是否见到弹窗)。
+
+        弹窗只会存活 3~5 秒（WeGame 自己收起），而整屏精读一帧要 2 秒多，
+        所以在存活期内根本看不到第二帧。必须只识别弹窗区域，才能连拍多帧。
+        """
+        region = self._account_menu_region(size)
         deadline = time.time() + timeout
+        image = None
+        lines: list = []
+        popup_seen = False
+        # 弹窗收起后的帧里没有账号行，留着当证据没意义，所以记住「见过弹窗」的那一帧
+        best_image = None
+        best_lines: list = []
         while time.time() < deadline:
             cancel.check()
-            _size, lines = self._ocr(window)
-            if lines:
-                text = self._text(lines)
-                if "无痕登录" in text or any(
-                    "注销" in normalize(line.text) for line in lines
-                ):
-                    return lines
-            time.sleep(1.0)
-        return []
+            try:
+                image, lines = self.reader.ocr(window, region=region)
+            except Exception as exc:
+                self.log(f"[account] 识别账号选择器失败: {exc}")
+                time.sleep(0.4)
+                continue
+            text = self._text(lines)
+            if "无痕登录" in text or any(
+                "注销" in normalize(line.text) for line in lines
+            ):
+                popup_seen = True
+                best_image, best_lines = image, lines
+                target = self._find_account_line(lines, account, start, size)
+                if target is not None:
+                    return target, image, lines, True
+            time.sleep(0.3)
+        if popup_seen:
+            return None, best_image, best_lines, True
+        return None, image, lines, False
+
+    def _find_account_lines(self, lines, account: dict, start, size):
+        """返回选择器里所有可能的账号行，按可靠性排序。
+
+        选择器里同一个账号可能出现多个「微信」文本（左侧平台标识/右侧账号名）；
+        不能直接取第一行，优先取账号名列（实测 cx 约 0.60~0.62w）。
+        """
+        width, height = size
+        candidates = []
+        for line in lines:
+            norm = normalize(line.text)
+            if not norm:
+                continue
+            if line.cx < width * 0.35:
+                continue
+            if not (height * 0.35 < line.cy < start.cy - height * 0.01):
+                continue
+            if not any(match in norm for match in account["matches"]):
+                continue
+            in_name_column = width * 0.58 <= line.cx <= width * 0.72
+            candidates.append((in_name_column, line.score, line.cx, line))
+        candidates.sort(
+            key=lambda item: (item[0], item[1], item[2]), reverse=True
+        )
+        return [item[3] for item in candidates]
+
+    def _find_account_line(self, lines, account: dict, start, size):
+        rows = self._find_account_lines(lines, account, start, size)
+        return rows[0] if rows else None
+
+    def _account_click_points(self, target):
+        points = [
+            (target.left + target.width * 0.5, target.cy),
+            (target.left + target.width * 0.35, target.cy),
+            (target.left + target.width * 0.7, target.cy),
+            (target.cx, target.cy),
+        ]
+        result = []
+        for x, y in points:
+            if not any(
+                abs(x - px) <= 2 and abs(y - py) <= 2 for px, py in result
+            ):
+                result.append((x, y))
+        return result
+
+    def _account_switch_state(self, window, account, start, size):
+        width, height = size
+        _image, lines = self.reader.ocr(
+            window, region=self._account_menu_region(size)
+        )
+        text = self._text(lines)
+        popup = "无痕登录" in text or any(
+            "注销" in normalize(line.text) for line in lines
+        )
+        bottom_region = (
+            int(width * 0.40),
+            int(height * 0.86),
+            int(width * 0.78),
+            int(height * 0.99),
+        )
+        _bottom_image, bottom_lines = self.reader.ocr(
+            window, region=bottom_region
+        )
+        button = self._find_account_button(bottom_lines, start, size)
+        label_ok = bool(
+            button is not None
+            and self._line_matches_account(button, account)
+        )
+        return popup, label_ok
+
+    def _wait_account_switched(self, window, account, start, size, timeout=7.0):
+        deadline = time.time() + timeout
+        grace = None
+        popup_left = False
+        while time.time() < deadline:
+            cancel.check()
+            try:
+                popup, label_ok = self._account_switch_state(
+                    window, account, start, size
+                )
+            except Exception as exc:
+                self.log(f"[account] 校验切换状态失败: {exc}")
+                time.sleep(0.4)
+                continue
+            popup_left = popup
+            if label_ok:
+                if popup:
+                    winutil.press_key("escape")
+                return True, popup
+            if not popup:
+                if grace is None:
+                    grace = time.time() + 4.0
+                elif time.time() >= grace:
+                    return False, False
+            else:
+                grace = None
+            time.sleep(0.45)
+        return False, popup_left
+
+    def _dump_account_fail(self, image, lines, account: dict) -> None:
+        """选择器里没找到账号时留证据：原图 + 该帧全部识别行。"""
+        try:
+            out_dir = BASE_DIR / "logs" / "debug" / "account"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+            image.save(out_dir / f"account_{stamp}.png")
+            dump = "\n".join(
+                f"{normalize(line.text)!r}\t"
+                f"cx={line.cx:.1f}\tcy={line.cy:.1f}\t"
+                f"w={line.width:.1f}\tscore={line.score:.2f}"
+                for line in sorted(lines, key=lambda l: (l.cy, l.cx))
+            )
+            (out_dir / f"account_{stamp}.txt").write_text(
+                f"target={account['label']} matches={account['matches']}\n"
+                + (dump or "(无识别结果)"),
+                encoding="utf-8",
+            )
+            self.log(f"[account] 选择器现场已保存: {out_dir / f'account_{stamp}.png'}")
+        except Exception as exc:  # 落盘失败不能影响主流程
+            self.log(f"[account] 保存现场失败: {exc}")
 
     def _switch_wegame_account(
         self,
@@ -454,64 +628,113 @@ class Launcher:
             time.sleep(1.0)
             _size, retry_lines = self._ocr(window)
             button = self._find_account_button(retry_lines, start, size)
-        legacy_x = start.cx - width * 0.145
-        attempts = []
+
+        candidates = []
         if button is not None:
-            attempts.append(
+            candidates.append(
                 (
                     button.cx,
                     button.cy,
                     f"账号按钮「{normalize(button.text)}」",
                 )
             )
-        if button is None or abs(button.cx - legacy_x) > 2:
-            attempts.append((legacy_x, start.cy, "固定偏移"))
-        popup_lines = []
-        for x, y, label in attempts:
+        for fraction, name in ((0.183, "图标布局偏移"), (0.145, "固定偏移")):
+            x = start.cx - width * fraction
+            if not any(
+                abs(x - cx) <= 3 and abs(start.cy - cy) <= 3
+                for cx, cy, _label in candidates
+            ):
+                candidates.append((x, start.cy, name))
+
+        last_image = None
+        last_lines: list = []
+        popup_seen = False
+        active_candidate = 0
+        for attempt in range(3):
+            click_x, click_y, label = candidates[active_candidate]
+            suffix = f" 第{attempt + 1}次" if attempt else ""
             self.log(
-                f"[account] 打开账号选择器（{label}）@({x:.0f},{y:.0f})"
+                f"[account] 打开账号选择器（{label}）"
+                f"@({click_x:.0f},{click_y:.0f}){suffix}"
             )
-            winutil.click_client(window.hwnd, x, y)
-            popup_lines = self._wait_account_menu(window)
-            if popup_lines:
-                break
-            self.log("[account] 未出现无痕登录选择框")
-            time.sleep(0.8)
-        if not popup_lines:
-            _size, current_lines = self._ocr(window)
-            current = self._find_account_button(current_lines, start, size)
-            if current is not None and self._line_matches_account(
-                current, account
-            ):
-                self.log(
-                    f"[account] 选择器未打开，但当前账号已是 "
-                    f"{account['label']}，继续"
+            winutil.click_client(window.hwnd, click_x, click_y)
+            _target, image, lines, seen = self._read_account_popup(
+                window, account, start, size
+            )
+            if image is not None:
+                last_image, last_lines = image, lines
+            popup_seen = popup_seen or seen
+            if not seen:
+                self.log("[account] 未出现无痕登录选择框")
+                active_candidate = min(
+                    active_candidate + 1, len(candidates) - 1
                 )
-                return
-            raise LaunchError(
-                "未能打开 WeGame 账号选择器，已中止（避免用错账号启动）"
-            )
-        target = None
-        for line in popup_lines:
-            norm = normalize(line.text)
-            if (
-                any(match in norm for match in account["matches"])
-                and line.cx > width * 0.5
-                and line.cy < start.cy - height * 0.02
-                and line.cy > height * 0.4
-            ):
-                target = line
-                break
-        if target is None:
-            raise LaunchError(
-                f"账号选择器中未找到「{account['label']}」"
-            )
-        click_x = target.left + target.width * 0.35
-        self.log(
-            f"[account] 选择 {account['label']} @({click_x:.0f},{target.cy:.0f})"
+                time.sleep(0.8)
+                continue
+
+            targets = self._find_account_lines(lines, account, start, size)
+            if not targets:
+                self.log(
+                    f"[account] 选择器已打开但未出现「{account['label']}」，"
+                    f"收起后重开"
+                )
+                if last_image is not None:
+                    self._dump_account_fail(last_image, last_lines, account)
+                winutil.press_key("escape")
+                time.sleep(0.8)
+                continue
+
+            popup_left = True
+            for target in targets[:3]:
+                for click_target_x, click_target_y in self._account_click_points(
+                    target
+                ):
+                    self.log(
+                        f"[account] 选择 {account['label']} "
+                        f"@({click_target_x:.0f},{click_target_y:.0f})"
+                    )
+                    winutil.click_client(
+                        window.hwnd, click_target_x, click_target_y
+                    )
+                    time.sleep(1.0)
+                    confirmed, popup_left = self._wait_account_switched(
+                        window, account, start, size
+                    )
+                    if confirmed:
+                        self.log(
+                            f"[account] 账号切换已确认: {account['label']}"
+                        )
+                        return
+                    if not popup_left:
+                        break
+                    time.sleep(0.4)
+                if not popup_left:
+                    break
+
+            self.log("[account] 点击目标账号后未确认切换")
+            if last_image is not None:
+                self._dump_account_fail(last_image, last_lines, account)
+            if popup_left:
+                winutil.press_key("escape")
+            time.sleep(0.8)
+
+        _size, current_lines = self._ocr(window)
+        current = self._find_account_button(current_lines, start, size)
+        if current is not None and self._line_matches_account(current, account):
+            self.log(f"[account] 当前账号已是 {account['label']}，继续")
+            return
+        if last_image is not None:
+            self._dump_account_fail(last_image, last_lines, account)
+        seen = [
+            normalize(line.text)
+            for line in last_lines
+            if normalize(line.text)
+        ]
+        raise LaunchError(
+            f"未能确认 WeGame 账号切换到「{account['label']}」"
+            f"（已重开 3 次，最后一次可见文字："
+            f"{'、'.join(seen[:12]) or '无'}）"
         )
-        winutil.click_client(window.hwnd, click_x, target.cy)
-        time.sleep(1.2)
 
     def _wait_game_window(self) -> winutil.WindowInfo:
         timeout = self.config["timeouts"]["game_window"]

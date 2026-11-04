@@ -4,8 +4,8 @@
 
 Windows 桌面自动化工具：自动启动 WeGame → 三角洲行动 → 进入大厅/特勤处，读取四个工位的生产倒计时，按完成时间安排下一轮；同时支持 QQ/微信双账号、交易行子弹兑换、领取与制作、F12 取消、托盘常驻和无人值守。
 
-> 当前版本：**v0.01**  
-> Release：https://github.com/hebingking/DeltaForce-SS-Auto/releases/tag/v0.01  
+> 当前版本：**v0.02**  
+> Release：https://github.com/hebingking/DeltaForce-SS-Auto/releases/tag/v0.02  
 > 源码：https://github.com/hebingking/DeltaForce-SS-Auto
 
 > 本项目是个人使用的桌面自动化工具，不提供游戏修改、注入或破解功能。使用前请阅读文末免责声明。
@@ -18,8 +18,8 @@ Windows 桌面自动化工具：自动启动 WeGame → 三角洲行动 → 进�
 - **双账号**：QQ / 微信顺序切换，通过账号按钮 OCR 定位，不依赖固定坐标；进入游戏后读取 UID 校验，防止用错账号执行
 - **倒计时读取**：读取技术中心、工作台、制药台、防具台四个工位的剩余时间
 - **自动排程**：按 10 分钟分组规则计算下一次启动时间；支持合并窗口、两种多账号模式、补跑、锁屏重试
-- **交易行兑换**：搜索子弹、识别兑换按钮状态和折扣；低于阈值/置灰/当日已完成时跳过；支持军需处兑换、一键补齐和确认
-- **领取与制作**：领取已完成奖励，按配置制作物品；可设置一键补齐总价上限
+- **领取与制作**：领取已完成奖励，按配置制作物品；可设置一键补齐总价上限（**先跑领取/制作，再决定要不要进交易行**）
+- **交易行兑换**：搜索子弹、识别兑换按钮状态和折扣；低于阈值/置灰/当日已完成时跳过；支持军需处兑换、一键补齐和确认。当日子弹已全部兑换/置灰时**直接跳过，不进交易行**
 - **F12 取消**：流程运行中按 F12 不再发送后续点击/按键，当前流程在下一个检查点退出
 - **结束关闭 WeGame**：可选；结束后延迟 N 秒正常关闭 WeGame 窗口，具体是否最小化到托盘由 WeGame 自身设置决定
 - **托盘 / 配置界面**：读取、立即执行、取消、暂停/恢复、查看下次时间、打开日志、环境检查
@@ -39,7 +39,7 @@ Windows 桌面自动化工具：自动启动 WeGame → 三角洲行动 → 进�
 
 ## 下载与安装（exe）
 
-1. 从 [v0.01 Release](https://github.com/hebingking/DeltaForce-SS-Auto/releases/tag/v0.01) 下载 `orc-sjz.exe`
+1. 从 [v0.02 Release](https://github.com/hebingking/DeltaForce-SS-Auto/releases/tag/v0.02) 下载 `orc-sjz.exe`
 2. 将仓库里的 [`config.example.json`](config.example.json) 复制为同目录的 `config.json`
 3. 打开 `config.json`，至少确认：
    - `wegeame_exe`：你的 WeGame 安装路径
@@ -50,7 +50,7 @@ Windows 桌面自动化工具：自动启动 WeGame → 三角洲行动 → 进�
 
 运行后程序在托盘常驻，主界面可保存配置、立即执行、取消当前流程和查看日志。
 
-> Release 里的 `orc-sjz.exe` 为 v0.01 构建，SHA-256：`5802d0f50d5e5eb54eb1bc3c9a2c9995221942809bbea082d8289cb2fefe33bb`。
+> Release 里的 `orc-sjz.exe` 为 v0.02 构建，SHA-256：`0e3fae51229ebe3acf2acc5985e40c4dff3f8d5835ffafd32386a08545863140`。
 
 ---
 
@@ -98,6 +98,9 @@ python app.py
 | `craft.enabled` / `max_purchase_total` / `items` | 领取制作开关、一键补齐总价上限、物品配置 |
 | `rule.group_threshold_minutes` / `buffer_seconds` | 倒计时分组阈值和启动缓冲 |
 | `ocr` / `timeouts` / `poll` / `notify` | OCR 后端、各阶段超时、轮询间隔、提示音 |
+| `ocr.max_dimension` / `native_upscale` | 精细识别（读取工位倒计时）用的尺寸上限和放大倍数 |
+| `ocr.fast_max_dimension` / `fast_upscale` | 交易行兑换高频轮询用的尺寸上限和放大倍数；默认 3000 / 1.0（即不缩放），调小更快、调大更准 |
+| `ocr.fast_det_limit` | 快读引擎的检测长边上限，默认 1152。只影响兑换轮询，**不影响工位倒计时识别精度** |
 
 ### 账号匹配与 UID
 
@@ -225,6 +228,9 @@ exe 未签名，点「更多信息 → 仍要运行」；运行需要管理员�
 
 **OCR 识别不稳定**  
 确保游戏分辨率/DPI 与运行环境一致；OCR 默认 RapidOCR，可在 `config.json` 的 `ocr` 中调整后端和放大倍数。
+
+**交易行兑换太慢**  
+兑换流程默认用 `ocr.fast_*` 低分辨率参数，并且只识别卡片区/弹窗区（不是整屏）。如果觉得慢，可以调小 `ocr.fast_det_limit`（默认 1152，调到 960 更快但小字更容易错）；如果出现折扣数字或物品名识别不到，把它调到 1536~2048 再试。日志里每颗子弹都有 `耗时 x.xs`，方便对照。
 
 ---
 

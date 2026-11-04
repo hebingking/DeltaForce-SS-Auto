@@ -41,6 +41,14 @@ DIALOG_MODAL_WORDS = (
     "确定用以下物品",
 ) + EXCHANGE_SUCCESS_WORDS + EXCHANGE_FAILURE_WORDS
 
+# 只识别需要的区域（相对整幅截图的 0~1 比例），大幅降低单次 OCR 耗时。
+# 卡片区：交易行搜索结果网格是 3 列 x 6 行，实测物品名 cx 落在 0.25/0.49/0.74、
+# cy 落在 0.17~0.85，这里取 x 0.14~0.85、y 0.06~0.92 覆盖整个网格
+# （旧值 0.54/0.42 只覆盖左上 2x2，目标排到第 3 列或第 3 行以下就找不到）。
+CARD_REGION = (0.14, 0.06, 0.85, 0.92)
+# 弹窗区：覆盖军需处兑换/结果弹窗/确认/确定/价格 的判定范围（x 0.3~0.7、y 0.35~0.9）。
+DIALOG_REGION = (0.22, 0.28, 0.80, 0.95)
+
 
 class ExchangeError(RuntimeError):
     pass
@@ -111,11 +119,7 @@ class ExchangeRunner:
         self.log = logger
         self.reader = reader or Reader(config, logger)
         self.exchange_config = config.get("exchange", {})
-        self.items = [
-            str(item).strip()
-            for item in self.exchange_config.get("items", [])
-            if str(item).strip()
-        ]
+        self.items = self._configured_items()
         self._search_box = None
         self.workshop = Workshop(config, logger, self.reader)
         self.base_dir = Path(base_dir) if base_dir else BASE_DIR
@@ -125,6 +129,18 @@ class ExchangeRunner:
             else self.base_dir / "exchange_history.json"
         )
         self.history = self._load_history()
+
+    def _configured_items(self) -> list[str]:
+        """从当前 config 读出子弹列表。
+
+        GUI 改配置是直接改同一个 dict，所以每次取最新的；
+        否则常驻实例会拿启动时的旧快照，“是否需要兑换”的判断会失真。
+        """
+        return [
+            str(item).strip()
+            for item in self.exchange_config.get("items", [])
+            if str(item).strip()
+        ]
 
     def _default_account_key(self) -> str:
         accounts = get_accounts(self.config)
@@ -204,14 +220,39 @@ class ExchangeRunner:
             if entry.get("date") == today and entry.get("account") == account_key
         }
 
+    def refresh_history(self) -> None:
+        """从磁盘重新读一次兑换记录。
+
+        Launcher 里的 ExchangeRunner 是常驻实例，而 GUI 的「清除今日兑换记录」
+        会直接改 exchange_history.json，不刷新就会拿内存里的旧结果误判“已完成”。
+        """
+        self.history = self._load_history()
+
+    def pending_items(self, account_key: str = "") -> list[str]:
+        """今天还没处理完的子弹（已兑换/已置灰的不算）。"""
+        if not self.exchange_config.get("enabled", True):
+            return []
+        items = self._configured_items()
+        if not items:
+            return []
+        self.refresh_history()
+        today = self.today_results(account_key)
+        return [
+            name
+            for name in items
+            if today.get(name) not in ("ok", "disabled")
+        ]
+
     def run(self, game, account_key: str = "") -> list[dict]:
         account_key = account_key or self._default_account_key()
         if not self.exchange_config.get("enabled", True):
             self.log("[exchange] 未启用，跳过交易行兑换")
             return []
+        self.items = self._configured_items()
         if not self.items:
             self.log("[exchange] 没有配置子弹，跳过")
             return []
+        self.refresh_history()
         if not self._open_market(game):
             raise ExchangeError("未能进入交易行页面")
         cancel.check()
@@ -252,13 +293,38 @@ class ExchangeRunner:
         return results
 
     # ---------- helpers ----------
-    def _snapshot(self, game):
+    @staticmethod
+    def _client_size(game) -> tuple[int, int]:
+        _left, _top, width, height = winutil.client_rect(game.hwnd)
+        return width, height
+
+    @staticmethod
+    def _region_px(size: tuple[int, int], spec):
+        if not spec:
+            return None
+        width, height = size
+        x0, y0, x1, y1 = spec
+        return (
+            int(width * x0),
+            int(height * y0),
+            int(width * x1),
+            int(height * y1),
+        )
+
+    def _snapshot(self, game, region=None, fast: bool = True):
         cancel.check()
         try:
-            return self.reader.ocr(game)
+            box = self._region_px(self._client_size(game), region)
+            return self.reader.ocr(game, region=box, fast=fast)
         except Exception as exc:
             self.log(f"[exchange] OCR 失败: {exc}")
             return None
+
+    def _cached_search_box(self, size: tuple[int, int]):
+        cached = self._search_box
+        if cached is not None and cached[0] == size[0] and cached[1] == size[1]:
+            return cached[2], cached[3]
+        return None
 
     @staticmethod
     def _text(lines) -> str:
@@ -293,7 +359,7 @@ class ExchangeRunner:
                 image, lines = snapshot
                 if self._market_ready(lines, image.size):
                     return True
-            time.sleep(1.5)
+            time.sleep(0.8)
         return False
 
     def _search_box_xy(self, image, lines):
@@ -327,34 +393,46 @@ class ExchangeRunner:
         return width * 0.115, height * 0.13
 
     def _search_text(self, game, name: str, use_unicode: bool = False) -> None:
-        snapshot = self._snapshot(game)
-        image = snapshot[0] if snapshot else None
-        lines = snapshot[1] if snapshot else []
-        x, y = self._search_box_xy(image, lines)
+        size = self._client_size(game)
+        xy = self._cached_search_box(size)
+        if xy is None:
+            # 只有没有缓存时才需要整屏 OCR 去找搜索框
+            snapshot = self._snapshot(game)
+            if snapshot is not None:
+                image, lines = snapshot
+                xy = self._search_box_xy(image, lines)
+        if xy is None:
+            xy = (size[0] * 0.115, size[1] * 0.13)
+        x, y = xy
         winutil.click_client(game.hwnd, x, y)
-        time.sleep(0.3)
+        time.sleep(0.25)
         winutil.press_ctrl("a")
         time.sleep(0.1)
         if use_unicode:
             winutil.type_text_unicode(name)
-            time.sleep(0.4)
+            time.sleep(0.3)
         else:
             winutil.set_clipboard_text(name)
             winutil.press_ctrl("v")
-            time.sleep(0.6)
+            time.sleep(0.5)
         winutil.press_key("enter")
-        time.sleep(2.5)
+        time.sleep(2.0)
 
     def _find_card(self, lines, size, name):
+        """在搜索结果卡片网格内找目标物品。
+
+        直接复用 CARD_REGION 的边界，避免两处阈值不一致
+        （旧写法 x_max=0.5 会把 cx=0.501 的第 2 列卡片判成越界）。
+        """
         width, height = size
         return find_line(
             lines,
             name,
             min_score=0.7,
-            x_min=width * 0.18,
-            x_max=width * 0.5,
-            y_min=height * 0.1,
-            y_max=height * 0.35,
+            x_min=width * CARD_REGION[0],
+            x_max=width * CARD_REGION[2],
+            y_min=height * CARD_REGION[1],
+            y_max=height * CARD_REGION[3],
         )
 
     def _search_and_open(self, game, name: str) -> None:
@@ -369,22 +447,22 @@ class ExchangeRunner:
     def _wait_card_and_click(self, game, name: str, timeout: float) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            snapshot = self._snapshot(game)
+            snapshot = self._snapshot(game, CARD_REGION)
             if snapshot is not None:
                 image, lines = snapshot
                 card = self._find_card(lines, image.size, name)
                 if card is not None:
                     self.log(f"[exchange] 打开搜索结果 @({card.cx:.0f},{card.cy:.0f})")
                     winutil.click_client(game.hwnd, card.cx, card.cy)
-                    time.sleep(2.0)
+                    time.sleep(1.5)
                     return True
-            time.sleep(1.5)
+            time.sleep(0.8)
         return False
 
     def _reopen_result(self, game, name: str) -> bool:
         deadline = time.time() + 8
         while time.time() < deadline:
-            snapshot = self._snapshot(game)
+            snapshot = self._snapshot(game, CARD_REGION)
             if snapshot is not None:
                 image, lines = snapshot
                 card = self._find_card(lines, image.size, name)
@@ -393,9 +471,9 @@ class ExchangeRunner:
                         f"[exchange] 重新打开搜索结果 @({card.cx:.0f},{card.cy:.0f})"
                     )
                     winutil.click_client(game.hwnd, card.cx, card.cy)
-                    time.sleep(2.0)
+                    time.sleep(1.5)
                     return True
-            time.sleep(1.2)
+            time.sleep(0.7)
         return False
 
     def _find_exchange_button_once(self, image, lines):
@@ -473,6 +551,7 @@ class ExchangeRunner:
 
     def _exchange_one(self, game, name: str) -> dict:
         self.log(f"[exchange] === 处理 {name} ===")
+        started = time.time()
         button = None
         image = None
         lines = []
@@ -491,12 +570,12 @@ class ExchangeRunner:
                     text = self._text(lines)
                     if "在售最低价" in text or "兑换" in text:
                         break
-                time.sleep(1.2)
+                time.sleep(0.7)
             if snapshot is not None:
                 button = self._find_exchange_button_once(image, lines)
                 if button is None:
                     for _ in range(2):
-                        time.sleep(1.5)
+                        time.sleep(1.0)
                         snapshot = self._snapshot(game)
                         if snapshot is not None:
                             image, lines = snapshot
@@ -511,7 +590,7 @@ class ExchangeRunner:
                     f"返回后重试"
                 )
                 self._back_to_search(game)
-                time.sleep(1.0)
+                time.sleep(0.8)
                 continue
             raise ExchangeError("详情页未找到兑换按钮")
         hint = any("更优惠" in normalize(line.text) for line in lines)
@@ -523,23 +602,25 @@ class ExchangeRunner:
         if brightness < 140:
             self.log("[exchange] 按钮为灰色（已兑换/不可用），不点击，跳过")
             self._back_to_search(game)
+            self.log(f"[exchange] {name} 耗时 {time.time() - started:.1f}s（跳过）")
             return {"item": name, "ok": False, "skipped": "disabled"}
         winutil.click_client(game.hwnd, button.cx, button.cy)
 
         modal = None
         deadline = time.time() + 8
         while time.time() < deadline:
-            snapshot = self._snapshot(game)
+            snapshot = self._snapshot(game, DIALOG_REGION)
             if snapshot is not None:
                 image, lines = snapshot
                 text = self._text(lines)
                 if "军需处兑换" in text or "预估兑换成本" in text:
                     modal = (image, lines)
                     break
-            time.sleep(1.5)
+            time.sleep(0.8)
         if modal is None:
             self.log("[exchange] 点击兑换后没有弹窗（按钮应为置灰），跳过")
             self._back_to_search(game)
+            self.log(f"[exchange] {name} 耗时 {time.time() - started:.1f}s（跳过）")
             return {"item": name, "ok": False, "skipped": "disabled"}
 
         image, lines = modal
@@ -547,8 +628,9 @@ class ExchangeRunner:
         if discount is None:
             self.log("[exchange] 未识别到折扣百分比，跳过")
             winutil.press_key("escape")
-            time.sleep(1.5)
+            time.sleep(1.0)
             self._back_to_search(game)
+            self.log(f"[exchange] {name} 耗时 {time.time() - started:.1f}s（跳过）")
             return {"item": name, "ok": False, "skipped": "unknown_discount"}
         threshold = float(self.exchange_config.get("min_discount_percent", 20))
         if discount < threshold:
@@ -556,8 +638,9 @@ class ExchangeRunner:
                 f"[exchange] 折扣 {discount}% 低于阈值 {threshold:g}%，不兑换"
             )
             winutil.press_key("escape")
-            time.sleep(1.5)
+            time.sleep(1.0)
             self._back_to_search(game)
+            self.log(f"[exchange] {name} 耗时 {time.time() - started:.1f}s（跳过）")
             return {
                 "item": name,
                 "ok": False,
@@ -567,6 +650,7 @@ class ExchangeRunner:
         self.log(f"[exchange] 折扣 {discount}% 达标，开始兑换")
         ok = self._complete_exchange(game)
         self._back_to_search(game)
+        self.log(f"[exchange] {name} 耗时 {time.time() - started:.1f}s")
         return {"item": name, "ok": ok, "discount": discount}
 
     @staticmethod
@@ -591,9 +675,9 @@ class ExchangeRunner:
 
     def _dismiss_result_dialog(self, game) -> bool:
         for _ in range(2):
-            snapshot = self._snapshot(game)
+            snapshot = self._snapshot(game, DIALOG_REGION)
             if snapshot is None:
-                time.sleep(1.0)
+                time.sleep(0.6)
                 continue
             image, lines = snapshot
             text = self._text(lines)
@@ -603,14 +687,14 @@ class ExchangeRunner:
                     f"[exchange] 关闭结果弹窗 @({button.cx:.0f},{button.cy:.0f})"
                 )
                 winutil.click_client(game.hwnd, button.cx, button.cy)
-                time.sleep(1.5)
+                time.sleep(0.8)
                 continue
             if self._has_any(text, DIALOG_MODAL_WORDS):
                 winutil.press_key("escape")
-                time.sleep(1.2)
+                time.sleep(0.8)
                 continue
             return True
-        snapshot = self._snapshot(game)
+        snapshot = self._snapshot(game, DIALOG_REGION)
         if snapshot is None:
             return True
         return not self._has_any(self._text(snapshot[1]), DIALOG_MODAL_WORDS)
@@ -618,9 +702,9 @@ class ExchangeRunner:
     def _wait_exchange_result(self, game) -> bool:
         deadline = time.time() + 15
         while time.time() < deadline:
-            snapshot = self._snapshot(game)
+            snapshot = self._snapshot(game, DIALOG_REGION)
             if snapshot is None:
-                time.sleep(1.2)
+                time.sleep(0.8)
                 continue
             image, lines = snapshot
             width, height = image.size
@@ -647,7 +731,7 @@ class ExchangeRunner:
                     f"[exchange] 点击第二层确认 @({confirm.cx:.0f},{confirm.cy:.0f})"
                 )
                 winutil.click_client(game.hwnd, confirm.cx, confirm.cy)
-                time.sleep(2.0)
+                time.sleep(1.2)
                 continue
             if self._has_any(text, DIALOG_MODAL_WORDS):
                 button = self._find_dismiss_button(lines, image.size)
@@ -656,15 +740,22 @@ class ExchangeRunner:
                         f"[exchange] 关闭结果弹窗 @({button.cx:.0f},{button.cy:.0f})"
                     )
                     winutil.click_client(game.hwnd, button.cx, button.cy)
-                    time.sleep(1.5)
+                    time.sleep(0.8)
                     continue
                 winutil.press_key("escape")
-                time.sleep(1.2)
+                time.sleep(0.8)
                 continue
-            if self._market_ready(lines, image.size) or "兑换" in text:
-                self.log("[exchange] 结果弹窗已关闭，按成功处理")
-                return True
-            time.sleep(1.2)
+            # 弹窗区没有对话框文字：用整屏确认是否已经回到可操作页面
+            full = self._snapshot(game, None)
+            if full is not None:
+                full_image, full_lines = full
+                if (
+                    self._market_ready(full_lines, full_image.size)
+                    or "兑换" in self._text(full_lines)
+                ):
+                    self.log("[exchange] 结果弹窗已关闭，按成功处理")
+                    return True
+            time.sleep(0.7)
         self.log("[exchange] 等待兑换结果超时，按失败处理")
         self._dismiss_result_dialog(game)
         return False
@@ -672,9 +763,9 @@ class ExchangeRunner:
     def _complete_exchange(self, game) -> bool:
         deadline = time.time() + 50
         while time.time() < deadline:
-            snapshot = self._snapshot(game)
+            snapshot = self._snapshot(game, DIALOG_REGION)
             if snapshot is None:
-                time.sleep(1.5)
+                time.sleep(0.8)
                 continue
             image, lines = snapshot
             width, height = image.size
@@ -701,23 +792,24 @@ class ExchangeRunner:
             if confirm is not None:
                 self.log(f"[exchange] 点击确认 @({confirm.cx:.0f},{confirm.cy:.0f})")
                 winutil.click_client(game.hwnd, confirm.cx, confirm.cy)
-                time.sleep(2.0)
+                time.sleep(1.5)
                 return self._wait_exchange_result(game)
 
             price = self.workshop._modal_price(lines, image.size)
             if price is not None:
                 self.log(f"[exchange] 购买缺少材料，总价 {price[1]}")
                 winutil.click_client(game.hwnd, price[0].cx, price[0].cy)
-                time.sleep(2.5)
+                time.sleep(1.8)
                 continue
 
+            # 绿色按钮是像素判定，仍用整幅截图，不受 OCR 区域影响
             button = self.workshop._find_green_button(image)
             if button is not None:
                 self.log(
                     f"[exchange] 点击绿色按钮 @({button[0]},{button[1]})"
                 )
                 winutil.click_client(game.hwnd, button[0], button[1])
-                time.sleep(2.5)
+                time.sleep(1.8)
                 continue
 
             modal_exchange = self._find_modal_exchange(lines, image.size)
@@ -728,10 +820,10 @@ class ExchangeRunner:
                 winutil.click_client(
                     game.hwnd, modal_exchange.cx, modal_exchange.cy
                 )
-                time.sleep(2.0)
+                time.sleep(1.5)
                 continue
 
-            time.sleep(1.5)
+            time.sleep(0.8)
         self.log("[exchange] 兑换流程超时未完成")
         self._dismiss_result_dialog(game)
         return False
@@ -771,10 +863,10 @@ class ExchangeRunner:
                         f"[exchange] 关闭弹窗 @({dismiss.cx:.0f},{dismiss.cy:.0f})"
                     )
                     winutil.click_client(game.hwnd, dismiss.cx, dismiss.cy)
-                    time.sleep(1.5)
+                    time.sleep(0.9)
                     continue
             winutil.press_key("escape")
-            time.sleep(1.5)
+            time.sleep(0.9)
         snapshot = self._snapshot(game)
         if snapshot is not None:
             image, lines = snapshot
@@ -782,7 +874,7 @@ class ExchangeRunner:
             if nav is not None:
                 self.log("[exchange] ESC 未确认交易行，点击顶部交易行恢复")
                 winutil.click_client(game.hwnd, nav.cx, nav.cy)
-                time.sleep(2.0)
+                time.sleep(1.2)
         snapshot = self._snapshot(game)
         if snapshot is not None:
             image, lines = snapshot
@@ -799,7 +891,7 @@ class ExchangeRunner:
             if nav is not None:
                 self.log("[exchange] 返回特勤处")
                 winutil.click_client(game.hwnd, nav.cx, nav.cy)
-                time.sleep(2.0)
+                time.sleep(1.2)
         deadline = time.time() + 15
         while time.time() < deadline:
             snapshot = self._snapshot(game)
@@ -807,5 +899,5 @@ class ExchangeRunner:
                 image, lines = snapshot
                 if len(self.workshop._labels(lines, image.size)) >= 3:
                     return
-            time.sleep(1.5)
+            time.sleep(0.8)
         self.log("[exchange] 警告：没有回到特勤处页面")

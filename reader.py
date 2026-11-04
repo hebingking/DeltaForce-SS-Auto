@@ -105,12 +105,39 @@ class Reader:
             title_contains=self.config.get("game_title_hint", ""),
         )
 
-    def ocr(self, window: winutil.WindowInfo) -> tuple[Image.Image, list[OcrLine]]:
-        if not winutil.activate(window.hwnd):
+    def _fast_params(self) -> tuple[int, float]:
+        ocr_config = self.config.get("ocr", {})
+        return (
+            int(ocr_config.get("fast_max_dimension", 2000)),
+            float(ocr_config.get("fast_upscale", 1.0)),
+        )
+
+    def ocr(
+        self,
+        window: winutil.WindowInfo,
+        region=None,
+        fast: bool = False,
+    ) -> tuple[Image.Image, list[OcrLine]]:
+        """截图 + OCR。
+
+        region 为客户端像素坐标 (x0, y0, x1, y1)，只识别该区域；
+        返回的仍是整幅截图，识别框坐标已还原到整幅坐标系，调用方无需改阈值。
+        fast=True 用于高频轮询（兑换流程），用更低分辨率换取速度。
+        """
+        hwnd = window.hwnd
+        already_focused = winutil.is_foreground(hwnd)
+        if not winutil.activate(hwnd):
             raise ReaderError("游戏窗口无法切到前台")
-        time.sleep(0.15)
-        image = winutil.capture_client(window.hwnd)
-        return image, self._backend().recognize(image)
+        if not already_focused:
+            time.sleep(0.15)
+        image = winutil.capture_client(hwnd)
+        kwargs = {}
+        if fast:
+            max_dim, upscale = self._fast_params()
+            kwargs = {"max_dim": max_dim, "upscale": upscale}
+        return image, self._backend().recognize(
+            image, region=region, fast=fast, **kwargs
+        )
 
     def read(
         self,
