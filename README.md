@@ -4,8 +4,8 @@
 
 Windows 桌面自动化工具：自动启动 WeGame → 三角洲行动 → 进入大厅/特勤处，读取四个工位的生产倒计时，按完成时间安排下一轮；同时支持 QQ/微信双账号、交易行子弹兑换、领取与制作、F12 取消、托盘常驻和无人值守。
 
-> 当前版本：**v0.02**  
-> Release：https://github.com/hebingking/DeltaForce-SS-Auto/releases/tag/v0.02  
+> 当前版本：**v0.03**  
+> Release：https://github.com/hebingking/DeltaForce-SS-Auto/releases/tag/v0.03  
 > 源码：https://github.com/hebingking/DeltaForce-SS-Auto
 
 > 本项目是个人使用的桌面自动化工具，不提供游戏修改、注入或破解功能。使用前请阅读文末免责声明。
@@ -14,7 +14,7 @@ Windows 桌面自动化工具：自动启动 WeGame → 三角洲行动 → 进�
 
 ## 功能
 
-- **完整启动链路**：启动 WeGame、打开三角洲行动详情页、点击启动、进入烽火地带/大厅、打开特勤处
+- **完整启动链路**：启动 WeGame、打开三角洲行动详情页、点击启动、进入烽火地带/大厅、打开特勤处。进入游戏后若出现全屏活动页，会自动识别底部中央的「⎵ 继续」提示并先按空格，再继续 Tab/大厅流程（不依赖会变化的活动名称）
 - **双账号**：QQ / 微信顺序切换，通过账号按钮 OCR 定位，不依赖固定坐标；进入游戏后读取 UID 校验，防止用错账号执行
 - **倒计时读取**：读取技术中心、工作台、制药台、防具台四个工位的剩余时间
 - **自动排程**：按 10 分钟分组规则计算下一次启动时间；支持合并窗口、两种多账号模式、补跑、锁屏重试
@@ -39,7 +39,7 @@ Windows 桌面自动化工具：自动启动 WeGame → 三角洲行动 → 进�
 
 ## 下载与安装（exe）
 
-1. 从 [v0.02 Release](https://github.com/hebingking/DeltaForce-SS-Auto/releases/tag/v0.02) 下载 `orc-sjz.exe`
+1. 从 [v0.03 Release](https://github.com/hebingking/DeltaForce-SS-Auto/releases/tag/v0.03) 下载 `orc-sjz.exe`
 2. 将仓库里的 [`config.example.json`](config.example.json) 复制为同目录的 `config.json`
 3. 打开 `config.json`，至少确认：
    - `wegeame_exe`：你的 WeGame 安装路径
@@ -50,7 +50,7 @@ Windows 桌面自动化工具：自动启动 WeGame → 三角洲行动 → 进�
 
 运行后程序在托盘常驻，主界面可保存配置、立即执行、取消当前流程和查看日志。
 
-> Release 里的 `orc-sjz.exe` 为 v0.02 构建，SHA-256：`0e3fae51229ebe3acf2acc5985e40c4dff3f8d5835ffafd32386a08545863140`。
+> Release 里的 `orc-sjz.exe` 为 v0.03 构建，SHA-256：`7fd5d1eeb76ead97ab8991572d3bfe95e62da65fabcf9ea1000e26bb1c0b431b`。
 
 ---
 

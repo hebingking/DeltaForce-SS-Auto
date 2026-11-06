@@ -775,8 +775,8 @@ class Launcher:
 
         go_clicks = 0
         last_go = 0.0
-        space_pressed = False
-        space_at = 0.0
+        space_hits = 0
+        last_space = 0.0
         last_tab = 0.0
 
         while time.time() < deadline:
@@ -814,12 +814,30 @@ class Launcher:
                 time.sleep(6)
                 continue
 
-            if ("空格" in text or "空投夺宝" in text) and not space_pressed:
-                self.log("[launcher] 活动页面出现 → 按空格")
-                winutil.press_key("space")
-                space_pressed = True
-                space_at = time.time()
-                time.sleep(4)
+            now = time.time()
+            # 活动页的名称/内容每次都不一样，唯一稳定的信号是底部中央的
+            # 「⎵ 继续」提示。全屏 OCR 对这个小字打分偏低（实测 0.67），
+            # 所以单独降低阈值，且只认底部中央，避免误匹配正文里的「继续」。
+            space_hint = (
+                find_line(
+                    lines,
+                    "继续",
+                    min_score=0.55,
+                    y_min=height * 0.92,
+                    x_min=size[0] * 0.3,
+                    x_max=size[0] * 0.7,
+                )
+                is not None
+            )
+            if space_hint and space_hits < 4:
+                if now - last_space > 6:
+                    self.log("[launcher] 底部出现「继续」→ 按空格")
+                    winutil.press_key("space")
+                    space_hits += 1
+                    last_space = now
+                    time.sleep(3)
+                else:
+                    time.sleep(1.5)
                 continue
 
             hint = find_line(lines, "返回大厅") or find_line(lines, "进入特勤处")
@@ -828,11 +846,10 @@ class Launcher:
                 and line.cy > height * 0.86
                 for line in lines
             )
-            now = time.time()
             should_tab = (
                 hint is not None
                 or tab_hint
-                or (space_pressed and now - space_at > 6)
+                or (space_hits and now - last_space > 6)
                 or (go_clicks and now - last_go > 30)
             )
             if should_tab and now - last_tab > 6:
@@ -842,9 +859,17 @@ class Launcher:
                     else "底部Tab提示"
                     if tab_hint
                     else "空格后等待"
-                    if space_pressed
+                    if space_hits
                     else "前往游玩后兜底"
                 )
+                if reason == "前往游玩后兜底" and space_hits == 0:
+                    # OCR 没识别到底部提示时的兜底：先按一次空格再退回 Tab
+                    self.log("[launcher] 未识别全屏页 → 先按空格")
+                    winutil.press_key("space")
+                    space_hits += 1
+                    last_space = now
+                    time.sleep(3)
+                    continue
                 self.log(f"[launcher] 按 Tab（{reason}）")
                 winutil.press_key("tab")
                 last_tab = now
