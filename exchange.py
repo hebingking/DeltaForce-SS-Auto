@@ -829,6 +829,11 @@ class ExchangeRunner:
         return False
 
     def _search_page_ready(self, lines, size) -> bool:
+        text = self._text(lines)
+        # 物品详情页也有「购买/弹药」，且搜索框坐标已缓存；不先排除的话
+        # _back_to_search 会把详情页当成搜索页，不再按 ESC 关闭详情页。
+        if any(word in text for word in ("在售最低价", "挂单", "平均单价")):
+            return False
         if not self._market_ready(lines, size):
             return False
         if find_line(lines, "请输入想要查找的商品", min_score=0.55) is not None:
@@ -882,16 +887,21 @@ class ExchangeRunner:
                 self.log("[exchange] 警告：未能回到交易行搜索页")
 
     def _return_to_teqin(self, game) -> None:
-        snapshot = self._snapshot(game)
-        if snapshot is not None:
-            image, lines = snapshot
-            if len(self.workshop._labels(lines, image.size)) >= 3:
-                return
-            nav = find_line(lines, "特勤处", y_max=image.size[1] * 0.12)
-            if nav is not None:
-                self.log("[exchange] 返回特勤处")
-                winutil.click_client(game.hwnd, nav.cx, nav.cy)
-                time.sleep(1.2)
+        for _ in range(4):
+            snapshot = self._snapshot(game)
+            if snapshot is not None:
+                image, lines = snapshot
+                if len(self.workshop._labels(lines, image.size)) >= 3:
+                    return
+                nav = find_line(lines, "特勤处", y_max=image.size[1] * 0.12)
+                if nav is not None:
+                    self.log("[exchange] 返回特勤处")
+                    winutil.click_client(game.hwnd, nav.cx, nav.cy)
+                    time.sleep(1.2)
+                    break
+            # 可能还停在物品详情页：顶部没有「特勤处」导航，先 ESC 退一层
+            winutil.press_key("escape")
+            time.sleep(0.9)
         deadline = time.time() + 15
         while time.time() < deadline:
             snapshot = self._snapshot(game)
