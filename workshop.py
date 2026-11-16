@@ -49,7 +49,6 @@ class Workshop:
         for station in self.config["stations"]:
             cancel.check()
             item = self.items.get(station, {})
-            name = (item.get("name") or "").strip()
 
             if station in producing:
                 self.log(f"[craft] {station} 仍在生产，跳过")
@@ -59,47 +58,61 @@ class Workshop:
                 )
                 continue
 
+            results.append(self._run_station(game, station, item))
+
+        self._back_to_teqin(game)
+        self.log(f"[craft] 本轮结果: {results}")
+        return results
+
+    def _run_station(self, game, station: str, item: dict) -> dict:
+        name = (item.get("name") or "").strip()
+        claimed = False
+        for attempt in range(3):
+            cancel.check()
             try:
                 state = self._open_station(game, station)
-                claimed = False
                 if state == "reward":
                     self._dismiss_reward(game)
                     claimed = True
                     self.log(f"[craft] {station} 已领取奖励")
                     if not name:
-                        results.append(
-                            {"station": station, "claimed": True,
-                             "crafted": False, "skipped": "no_item"}
-                        )
-                        continue
+                        return {
+                            "station": station, "claimed": True,
+                            "crafted": False, "skipped": "no_item",
+                        }
                     state = self._open_station(game, station)
 
                 if not name:
                     self.log(f"[craft] {station} 未配置目标物品，只领取不制作")
                     self._back_to_teqin(game)
-                    results.append(
-                        {"station": station, "claimed": claimed,
-                         "crafted": False, "skipped": "no_item"}
-                    )
-                    continue
+                    return {
+                        "station": station, "claimed": claimed,
+                        "crafted": False, "skipped": "no_item",
+                    }
 
                 self._craft_on_page(game, station, item)
-                results.append(
-                    {"station": station, "claimed": claimed, "crafted": True}
-                )
+                return {"station": station, "claimed": claimed, "crafted": True}
             except RunCancelled:
                 raise
             except Exception as exc:
-                self.log(f"[craft] {station} 处理失败: {exc}")
+                self.log(f"[craft] {station} 第{attempt + 1}次失败: {exc}")
+                try:
+                    image = winutil.capture_client(game.hwnd)
+                    self._save_craft_failure(image, station)
+                except Exception as save_exc:
+                    self.log(f"[craft] 保存失败现场失败: {save_exc}")
+                if attempt < 2:
+                    self.log(f"[craft] {station} 重试（{attempt + 1}/2）")
+                    self._back_to_teqin(game)
+                    time.sleep(2.0)
+                    continue
                 self._back_to_teqin(game)
-                results.append(
-                    {"station": station, "claimed": False, "crafted": False,
-                     "error": str(exc)}
-                )
-
-        self._back_to_teqin(game)
-        self.log(f"[craft] 本轮结果: {results}")
-        return results
+                return {
+                    "station": station, "claimed": claimed,
+                    "crafted": False, "error": str(exc),
+                }
+        return {"station": station, "claimed": claimed,
+                "crafted": False, "error": "未知错误"}
 
     # ---------- 页面辅助 ----------
     def _snapshot(self, game):
@@ -367,7 +380,7 @@ class Workshop:
             hit = self._find_item_scrolling(game, size, name)
         if hit is not None:
             self.log(f"[craft] 选择物品「{name}」@({hit.cx:.0f},{hit.cy:.0f})")
-            winutil.click_client(game.hwnd, hit.cx, hit.cy)
+            click_x, click_y = hit.cx, hit.cy
         else:
             fallback = item.get("fallback_xy")
             if not fallback:
@@ -377,14 +390,44 @@ class Workshop:
             self.log(
                 f"[craft] 使用坐标兜底选择「{name}」@({fallback[0]},{fallback[1]})"
             )
-            winutil.click_client(game.hwnd, fallback[0], fallback[1])
-        time.sleep(1.8)
+            click_x, click_y = fallback[0], fallback[1]
+        winutil.click_client(game.hwnd, click_x, click_y)
 
-        snapshot = self._snapshot(game)
-        if snapshot is None:
-            raise WorkshopError("选择物品后 OCR 失败")
-        image, lines = snapshot
-        size = image.size
+        # 选择后等待制作面板出现；面板没出来时重新选一次，避免一次点击
+        # 落在过渡布局/滚动动画上就直接判失败。
+        panel_ready = False
+        last_image = None
+        for attempt in range(2):
+            if attempt:
+                self.log(f"[craft] 未出现制作面板，重新选择「{name}」")
+                snapshot = self._snapshot(game)
+                if snapshot is not None:
+                    image, lines = snapshot
+                    size = image.size
+                    again = self._find_item(lines, size, name)
+                    if again is not None:
+                        click_x, click_y = again.cx, again.cy
+                    winutil.click_client(game.hwnd, click_x, click_y)
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                snapshot = self._snapshot(game)
+                if snapshot is not None:
+                    image, lines = snapshot
+                    size = image.size
+                    last_image = image
+                    if (
+                        self._bottom_button(lines, size, "生产") is not None
+                        or self._bottom_button(lines, size, "一键补齐")
+                        is not None
+                    ):
+                        panel_ready = True
+                        break
+                time.sleep(0.8)
+            if panel_ready:
+                break
+        if not panel_ready:
+            self._save_craft_failure(last_image, station)
+            raise WorkshopError("未找到「一键补齐」或「生产」按钮")
 
         produce = self._bottom_button(lines, size, "生产")
         if produce is not None:

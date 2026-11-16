@@ -256,6 +256,19 @@ class Launcher:
         )
         winutil.click_client(window.hwnd, line.cx, line.cy)
 
+    def _dump_launch_fail(self, window, account: dict | None) -> None:
+        """详情页没找到「启动」时保存现场截图。"""
+        try:
+            out_dir = BASE_DIR / "logs" / "debug" / "launch"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+            image = winutil.capture_client(window.hwnd)
+            path = out_dir / f"launch_fail_{stamp}.png"
+            image.save(path)
+            self.log(f"[launcher] 详情页现场已保存: {path}")
+        except Exception as exc:  # 落盘失败不能影响主流程
+            self.log(f"[launcher] 保存详情页现场失败: {exc}")
+
     def _ensure_wegame(self) -> winutil.WindowInfo:
         window = self._find_wegame()
         if window:
@@ -337,7 +350,43 @@ class Launcher:
         if not opened_detail:
             raise LaunchError("WeGame 首页未找到「三角洲行动」")
 
-        deadline = time.time() + self.config["timeouts"]["detail_page"]
+        detail_timeout = self.config["timeouts"]["detail_page"]
+        if self._wait_detail_start(window, account, min(20.0, detail_timeout)):
+            return
+
+        # 冷启动时首页可能还在过渡布局，第一次点击未必打开详情页：
+        # ESC 退回首页，重新 OCR 再点一次侧栏里的「三角洲行动」。
+        self.log("[launcher] 详情页未出现「启动」，回首页重试")
+        winutil.press_key("escape")
+        time.sleep(1.5)
+        retry_deadline = time.time() + 10
+        while time.time() < retry_deadline:
+            cancel.check()
+            size, lines = self._ocr(window)
+            if not lines:
+                time.sleep(1.5)
+                continue
+            width, _height = size
+            candidates = [
+                line
+                for line in lines
+                if match_score("三角洲行动", line.text) >= 0.72
+                and line.cx < width * 0.35
+            ]
+            if candidates:
+                # 同名横幅通常更靠上；优先侧栏靠下的真实游戏条目
+                candidates.sort(key=lambda line: (line.cy, line.cx), reverse=True)
+                self._click(window, candidates[0])
+                time.sleep(3)
+                if self._wait_detail_start(window, account, detail_timeout):
+                    return
+                break
+            time.sleep(1.5)
+        self._dump_launch_fail(window, account)
+        raise LaunchError("三角洲详情页未找到「启动」按钮")
+
+    def _wait_detail_start(self, window, account: dict | None, timeout: float) -> bool:
+        deadline = time.time() + timeout
         while time.time() < deadline:
             cancel.check()
             size, lines = self._ocr(window)
@@ -363,9 +412,9 @@ class Launcher:
                     if fresh is not None:
                         start = fresh
                 self._click(window, start)
-                return
+                return True
             time.sleep(2)
-        raise LaunchError("三角洲详情页未找到「启动」按钮")
+        return False
 
     def _wait_start_button(self, window: winutil.WindowInfo):
         deadline = time.time() + 8

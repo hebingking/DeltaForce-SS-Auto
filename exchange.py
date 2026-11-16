@@ -46,8 +46,10 @@ DIALOG_MODAL_WORDS = (
 # cy 落在 0.17~0.85，这里取 x 0.14~0.85、y 0.06~0.92 覆盖整个网格
 # （旧值 0.54/0.42 只覆盖左上 2x2，目标排到第 3 列或第 3 行以下就找不到）。
 CARD_REGION = (0.14, 0.06, 0.85, 0.92)
-# 弹窗区：覆盖军需处兑换/结果弹窗/确认/确定/价格 的判定范围（x 0.3~0.7、y 0.35~0.9）。
-DIALOG_REGION = (0.22, 0.28, 0.80, 0.95)
+# 弹窗区：覆盖军需处兑换/结果弹窗/确认/确定/价格/一键补齐清单
+# （x 0.3~0.7、y 0.35~0.9）；「一键补齐清单」标题在约 0.26h，
+# 所以向上扩到 0.20h，否则识别不到缺材料清单。
+DIALOG_REGION = (0.22, 0.20, 0.80, 0.95)
 
 
 class ExchangeError(RuntimeError):
@@ -762,16 +764,34 @@ class ExchangeRunner:
 
     def _complete_exchange(self, game) -> bool:
         deadline = time.time() + 50
+        clicked = False
+        material_clicked = False
+        material_clicked_at = 0.0
+        material_wait_until = 0.0
+        idle_since = None
+        last_image = None
         while time.time() < deadline:
             snapshot = self._snapshot(game, DIALOG_REGION)
             if snapshot is None:
                 time.sleep(0.8)
                 continue
             image, lines = snapshot
+            last_image = image
             width, height = image.size
             text = self._text(lines)
 
             if self._has_any(text, EXCHANGE_SUCCESS_WORDS):
+                # 自动补齐材料后，游戏可能先弹「购买成功」；这不是兑换成功。
+                if (
+                    material_clicked
+                    and time.time() < material_wait_until
+                    and "兑换成功" not in text
+                    and "兑换完成" not in text
+                ):
+                    self.log("[exchange] 材料购买成功，继续兑换")
+                    self._dismiss_result_dialog(game)
+                    time.sleep(0.8)
+                    continue
                 self.log("[exchange] 识别到兑换成功")
                 self._dismiss_result_dialog(game)
                 return True
@@ -792,14 +812,31 @@ class ExchangeRunner:
             if confirm is not None:
                 self.log(f"[exchange] 点击确认 @({confirm.cx:.0f},{confirm.cy:.0f})")
                 winutil.click_client(game.hwnd, confirm.cx, confirm.cy)
+                clicked = True
+                idle_since = None
                 time.sleep(1.5)
                 return self._wait_exchange_result(game)
 
             price = self.workshop._modal_price(lines, image.size)
             if price is not None:
-                self.log(f"[exchange] 购买缺少材料，总价 {price[1]}")
-                winutil.click_client(game.hwnd, price[0].cx, price[0].cy)
-                time.sleep(1.8)
+                if not material_clicked:
+                    self.log(
+                        f"[exchange] 缺少兑换材料，自动补齐总价 {price[1]}"
+                    )
+                    winutil.click_client(game.hwnd, price[0].cx, price[0].cy)
+                    material_clicked = True
+                    material_clicked_at = time.time()
+                    material_wait_until = material_clicked_at + 20
+                    time.sleep(2.0)
+                    continue
+                if time.time() - material_clicked_at > 20:
+                    self.log("[exchange] 材料购买未完成（可能余额不足），跳过")
+                    full = self._snapshot(game)
+                    if full is not None:
+                        self._dump_exchange_timeout(full[0], full[1])
+                    self._dismiss_result_dialog(game)
+                    return False
+                time.sleep(1.0)
                 continue
 
             # 绿色按钮是像素判定，仍用整幅截图，不受 OCR 区域影响
@@ -809,6 +846,8 @@ class ExchangeRunner:
                     f"[exchange] 点击绿色按钮 @({button[0]},{button[1]})"
                 )
                 winutil.click_client(game.hwnd, button[0], button[1])
+                clicked = True
+                idle_since = None
                 time.sleep(1.8)
                 continue
 
@@ -820,13 +859,71 @@ class ExchangeRunner:
                 winutil.click_client(
                     game.hwnd, modal_exchange.cx, modal_exchange.cy
                 )
+                clicked = True
+                idle_since = None
                 time.sleep(1.5)
                 continue
 
+            # 点击过兑换后，弹窗可能已经关闭：此时若回到交易行，或
+            # 详情页的兑换按钮已置灰，按成功处理，避免误记失败。
+            if clicked:
+                now = time.time()
+                if idle_since is None:
+                    idle_since = now
+                elif now - idle_since >= 4.0:
+                    if self._exchange_recovered(game):
+                        return True
+                    idle_since = now
             time.sleep(0.8)
+        full = self._snapshot(game)
+        if full is not None:
+            self._dump_exchange_timeout(full[0], full[1])
+        else:
+            self._dump_exchange_timeout(last_image, [])
         self.log("[exchange] 兑换流程超时未完成")
         self._dismiss_result_dialog(game)
         return False
+
+    def _exchange_recovered(self, game) -> bool:
+        """弹窗已关闭时判断兑换是否已完成。"""
+        snapshot = self._snapshot(game)
+        if snapshot is None:
+            return False
+        image, lines = snapshot
+        text = self._text(lines)
+        if self._has_any(text, DIALOG_MODAL_WORDS):
+            return False
+        if self._search_page_ready(lines, image.size):
+            self.log("[exchange] 弹窗已关闭，回到交易行，按成功处理")
+            return True
+        button = self._find_exchange_button_once(image, lines)
+        if button is not None and self._text_brightness(image, button) < 140:
+            self.log("[exchange] 兑换按钮已置灰，按成功处理")
+            return True
+        return False
+
+    def _dump_exchange_timeout(self, image, lines) -> None:
+        """兑换超时时保存整页截图和 OCR 行，便于定位卡在哪一步。"""
+        if image is None:
+            return
+        try:
+            out_dir = BASE_DIR / "logs" / "debug" / "exchange"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+            path = out_dir / f"exchange_timeout_{stamp}.png"
+            image.save(path)
+            dump = "\n".join(
+                f"{normalize(line.text)!r}\t"
+                f"cx={line.cx:.1f}\tcy={line.cy:.1f}\t"
+                f"w={line.width:.1f}\tscore={line.score:.2f}"
+                for line in sorted(lines, key=lambda l: (l.cy, l.cx))
+            )
+            (out_dir / f"exchange_timeout_{stamp}.txt").write_text(
+                dump or "(无识别结果)", encoding="utf-8"
+            )
+            self.log(f"[exchange] 兑换超时现场已保存: {path}")
+        except Exception as exc:  # 落盘失败不能影响主流程
+            self.log(f"[exchange] 保存兑换超时现场失败: {exc}")
 
     def _search_page_ready(self, lines, size) -> bool:
         text = self._text(lines)
