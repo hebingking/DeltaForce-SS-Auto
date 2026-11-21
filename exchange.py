@@ -35,6 +35,7 @@ EXCHANGE_FAILURE_WORDS = (
     "无法购买",
     "无法兑换",
 )
+PRICE_CHANGE_WORDS = ("更优惠", "涨价", "降价", "涨幅", "跌幅")
 DIALOG_MODAL_WORDS = (
     "清单",
     "军需处兑换",
@@ -540,6 +541,55 @@ class ExchangeRunner:
                 return int(numbers[-1])
         return None
 
+    @staticmethod
+    def _count_color(image, line, kind: str) -> int:
+        pixels = image.load()
+        width, height = image.size
+        pad_x = max(6, int(line.height * 1.2))
+        pad_y = max(2, int(line.height * 0.4))
+        x0 = max(0, int(line.left) - pad_x)
+        x1 = min(width - 1, int(line.right) + pad_x)
+        y0 = max(0, int(line.top) - pad_y)
+        y1 = min(height - 1, int(line.bottom) + pad_y)
+        step_x = max(1, (x1 - x0) // 120)
+        step_y = max(1, (y1 - y0) // 24)
+        count = 0
+        for y in range(y0, y1 + 1, step_y):
+            for x in range(x0, x1 + 1, step_x):
+                r, g, b = pixels[x, y]
+                if max(r, g, b) - min(r, g, b) < 35:
+                    continue
+                if kind == "red" and r > 110 and r > g + 30 and r > b + 30:
+                    count += 1
+                elif kind == "green" and g > 100 and g > r + 30 and g > b + 10:
+                    count += 1
+        return count
+
+    def _price_change(self, image, lines) -> str:
+        """红色=涨价（不可兑换），绿色=降价（才看折扣），无法判断时保守跳过。"""
+        candidates = [
+            line
+            for line in lines
+            if "%" in line.text
+            or "％" in line.text
+            or any(word in normalize(line.text) for word in PRICE_CHANGE_WORDS)
+        ]
+        red = green = 0
+        for line in candidates:
+            red += self._count_color(image, line, "red")
+            green += self._count_color(image, line, "green")
+        self.log(f"[exchange] 涨跌颜色像素: red={red}, green={green}")
+        if red >= 6 and red >= green * 1.3:
+            return "up"
+        if green >= 6 and green >= red * 1.3:
+            return "down"
+        text = self._text(lines)
+        if "涨价" in text or "涨幅" in text:
+            return "up"
+        if "降价" in text or "更优惠" in text or "跌幅" in text:
+            return "down"
+        return "unknown"
+
     def _find_modal_exchange(self, lines, size):
         width, height = size
         for line in lines:
@@ -626,6 +676,21 @@ class ExchangeRunner:
             return {"item": name, "ok": False, "skipped": "disabled"}
 
         image, lines = modal
+        change = self._price_change(image, lines)
+        if change == "up":
+            self.log("[exchange] 红色涨价，不兑换")
+            winutil.press_key("escape")
+            time.sleep(1.0)
+            self._back_to_search(game)
+            self.log(f"[exchange] {name} 耗时 {time.time() - started:.1f}s（跳过）")
+            return {"item": name, "ok": False, "skipped": "price_up"}
+        if change == "unknown":
+            self.log("[exchange] 无法判断涨跌颜色，跳过")
+            winutil.press_key("escape")
+            time.sleep(1.0)
+            self._back_to_search(game)
+            self.log(f"[exchange] {name} 耗时 {time.time() - started:.1f}s（跳过）")
+            return {"item": name, "ok": False, "skipped": "unknown_change"}
         discount = self._parse_discount(lines)
         if discount is None:
             self.log("[exchange] 未识别到折扣百分比，跳过")
